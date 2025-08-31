@@ -1,0 +1,567 @@
+// File: edgeforge_orb_targets_v1_0_9.pine
+// Purpose: Enhanced ORB Strategy merging v1.0.8 feature set with the working indicator engine.
+//          Includes UDT targets, bias fill, session MA, adaptive/extended target display,
+//          breakout method variants, ATR/volume/trend filters, one-trade/day, risk% sizing with notional cap,
+//          BE-after-T1, time stop, and an optional “no new entries after X minutes” control.
+// Platform: TradingView Pine v6
+
+//@version=6
+strategy("EdgeForge ORB + Targets v1.0.9 (Strategy)",
+     overlay=true,
+     max_labels_count=500,
+     max_boxes_count=500,
+     max_lines_count=500,
+     calc_on_every_tick=false,          // keep OFF for backtests
+     initial_capital=100000,
+     pyramiding=1,                      // allow split entries on same bar
+     commission_type=strategy.commission.percent,
+     commission_value=0.005,
+     slippage=0)
+
+//-------------------------------
+// Error guard (intraday only)
+//-------------------------------
+if timeframe.in_seconds(timeframe.period) >= timeframe.in_seconds("D")
+    runtime.error("Timeframe is too high. Use an intraday timeframe (< 1 day).")
+
+//=====================================================================
+// Inputs
+//=====================================================================
+
+// Historical
+showHist = input.bool(true, "Show Historical Drawings", group="Historical Display")
+
+// --- Opening Range ---
+grpOR      = "Opening Range"
+orMode     = input.string("Custom Window", options=["From Session Open","Custom Window"], group=grpOR)
+sessionRTH = input.session("0930-1600", "Trading Session (Equities RTH)", group=grpOR)
+orMinutes  = input.int(30, "OR Length (minutes)", minval=1, group=grpOR)
+customOR   = input.session("0930-1000:1234567", "Custom OR Window", group=grpOR, tooltip="Supports day mask :1234567 for all days")
+
+// --- Breakout Method & Quality ---
+grpBRK     = "Breakout Method"
+brkMethod  = input.string("Close", "Method", options=["Close","High/Low","Close+Retest"], group=grpBRK)
+retestBars = input.int(3, "Retest Lookback (bars)", minval=1, group=grpBRK)
+retestTol  = input.float(0.10, "Retest Tolerance (×Range)", minval=0, step=0.01, group=grpBRK)
+skipBars   = input.int(0, "Skip Bars After OR Lock", minval=0, group=grpBRK)
+
+// --- Bias & Filters ---
+grpFilt   = "Bias & Filters"
+biasMode  = input.string("No Bias", "Signal Bias", options=["No Bias","Daily Bias"], group=grpFilt,
+           tooltip="Daily Bias: opposite-direction breakouts are gated until a first target in that direction prints.")
+useTrend  = input.bool(false, "Use EMA Trend Filter", group=grpFilt)
+emaLen    = input.int(200, "EMA Length", minval=1, group=grpFilt)
+useATR    = input.bool(true, "Use ATR Size Filter", group=grpFilt)
+atrLen    = input.int(14, "ATR Length", minval=1, group=grpFilt)
+minATRm   = input.float(0.30, "Min OR size (×ATR)", step=0.05, group=grpFilt)
+maxATRm   = input.float(1.20, "Max OR size (×ATR)", step=0.05, group=grpFilt)
+useVol    = input.bool(true, "Use Breakout Volume Filter", group=grpFilt)
+volLen    = input.int(20, "Vol SMA Length", minval=1, group=grpFilt)
+volMult   = input.float(1.20, "Breakout Vol ≥ k × SMA", step=0.05, group=grpFilt)
+minAbsVol = input.int(0, "Min Absolute Volume (0=off)", minval=0, group=grpFilt)
+
+// --- Trade Management ---
+grpTM        = "Trade Management"
+maxRiskPct   = input.float(1.0, "Max Risk % Per Trade", minval=0.1, maxval=5, step=0.1, group=grpTM)
+maxNotional  = input.float(25.0, "Max Notional % of Equity", minval=1, maxval=100, step=1, group=grpTM)
+onePerDay    = input.bool(true, "One Trade Per Day", group=grpTM)
+qtyT1pct     = input.float(50, "Position Split: T1 %", minval=1, maxval=99, step=1, group=grpTM)
+beAfterT1    = input.bool(true, "Breakeven After T1 (runner)", group=grpTM)
+t1R          = input.float(1.0, "T1 (R multiples)", step=0.25, group=grpTM)
+t2R          = input.float(2.0, "T2 (R multiples)", step=0.25, group=grpTM)
+
+// --- Targets (visual engine for UDT lines) ---
+grpTgt   = "Targets"
+tTog     = input.bool(true, "Show Targets", group=grpTgt)
+tPer     = input.int(60, "Target % of Range", minval=1, group=grpTgt) * 0.01
+tSrc     = input.string("Close", "Target Cross Source", options=["Close","Highs/Lows"], group=grpTgt)
+tDispType= input.string("Adaptive", "Target Display", options=["Adaptive","Extended"], group=grpTgt)
+
+// --- Time Controls ---
+grpTS          = "Time Controls"
+useTimeStop    = input.bool(false, "Use Time Stop", group=grpTS)
+timeStopMin    = input.int(60, "Exit After X Minutes", minval=1, group=grpTS)
+noNewAfterMins = input.int(100000, "No New Entries After (mins from Session Open / Custom Start)", minval=1, group=grpTS,
+                   tooltip="Large value effectively disables the cutoff.")
+
+// --- Session Moving Average ---
+grpMA    = "Session Moving Average"
+maTog    = input.bool(false, "", inline="MA", group=grpMA)
+maLen    = input.int(20, "", inline="MA", group=grpMA)
+maType   = input.string("EMA", "", options=["SMA","EMA","RMA","WMA","VWMA"], inline="MA", group=grpMA)
+maColor  = input.color(color.orange, "", inline="MA", group=grpMA)
+
+// --- Visuals ---
+grpVis      = "Visuals"
+showBox     = input.bool(true, "Show OR Box", group=grpVis)
+showLvls    = input.bool(true, "Show OR Levels & Mid", group=grpVis)
+showLabs    = input.bool(true, "Show Breakout Signals", group=grpVis)
+sigSizeStr  = input.string("Small", "Signal Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpVis)
+showDyn     = input.bool(true, "Show Dynamic Stop/TP Guides", group=grpVis)
+boxColorBull= input.color(color.new(color.green, 85), "Bull Bias Fill", group=grpVis)
+boxColorBear= input.color(color.new(color.red,   85), "Bear Bias Fill", group=grpVis)
+lvlColor    = input.color(color.new(color.gray, 0), "OR Levels Color", group=grpVis)
+orFillColor = input.color(color.new(color.gray,60), "OR Highlight Color", group=grpVis)
+tStyleStr   = input.string("___", "Target Style", options=["___","- - -",". . ."], group=grpVis)
+
+upSigColor   = input.color(#089981, "Up Signal Color", group=grpVis, inline="SC")
+downSigColor = input.color(#f23645, "Down Signal Color", group=grpVis, inline="SC")
+
+//=======================
+// Helper functions
+//=======================
+fz(_val) => _val == 0 ? 1 : _val
+
+day_ma(_start, _type, s, l) =>
+    bs_nd = fz(ta.barssince(_start))
+    v_len = bs_nd < l ? bs_nd : l
+    var float ma = na
+    if _type == "EMA"
+        k = 2.0 / (v_len + 1.0)
+        ma := (s * k) + (nz(ma[1]) * (1 - k))
+    if _type == "RMA"
+        a = (1.0 / v_len)
+        ma := a * s + (1 - a) * nz(ma[1])
+    if _type == "SMA"
+        ma := ta.sma(s, v_len)
+    if _type == "WMA"
+        ma := ta.wma(s, v_len)
+    if _type == "VWMA"
+        ma := ta.vwma(s, v_len)
+    ma
+
+linestyle(_input) =>
+    if _input == "___"
+        line.style_solid
+    else if _input == "- - -"
+        line.style_dashed
+    else if _input == ". . ."
+        line.style_dotted
+    else
+        line.style_solid  // default
+
+get_1up(_val) =>
+    fv = _val - math.floor(_val)
+    fv > 0 ? int(math.floor(_val) + 1) : int(_val)
+
+inSess(sess) => not na(time(timeframe.period, sess))
+isFirstBarInSess(sess) =>
+    _in = inSess(sess)
+    _in and not inSess(sess)[1]
+
+//=======================
+// UDTs
+//=======================
+type target
+    line ln
+    label lab
+
+//=======================
+// Variables
+//=======================
+var array<target> up_targs = array.new<target>()
+var array<target> down_targs = array.new<target>()
+var signals = array.new_label()
+
+var bool   or_sesh   = false
+var bool   or_token  = false
+var int    sessStartTs = na
+var int    orEndTs     = na
+
+var float  orh = na
+var float  orl = na
+var float  hst = na
+var float  lst = na
+var float  prev_orm = na
+orm = math.avg(orh, orl)
+orw = math.abs(orh - orl)
+
+var int    up_count   = na
+var int    down_count = na
+
+var box    or_bx = na
+var line   m_ln  = na
+var target h_ln  = target.new(na, na)
+var target l_ln  = target.new(na, na)
+
+var int    day_dir = 0
+var bool   down_check = false
+var bool   up_check   = false
+var bool   down_signal = false
+var bool   up_signal   = false
+
+invis = color.rgba(0,0,0,0)
+
+//=====================================================================
+// OR Session state
+//=====================================================================
+newSess = isFirstBarInSess(sessionRTH)
+inCustom = not na(time(timeframe.period, customOR))
+
+// Build session flags using selected mode
+if orMode == "Custom Window"
+    or_sesh := inCustom
+else
+    // From Session Open for N minutes inside RTH
+    if newSess
+        sessStartTs := time
+        orEndTs     := sessStartTs + orMinutes * 60000
+    or_sesh := inSess(sessionRTH) and time <= orEndTs
+
+or_start = or_sesh and not or_sesh[1]
+or_end   = or_sesh[1] and not or_sesh
+
+//=====================================================================
+// On OR start: reset state & drawings (optionally keep history)
+//=====================================================================
+if or_start
+    // clear targets
+    for i = 0 to array.size(up_targs)-1
+        t = array.get(up_targs, i)
+        if not showHist and not na(t.ln)
+            line.delete(t.ln)
+        if not na(t.lab)
+            label.delete(t.lab)
+    for i = 0 to array.size(down_targs)-1
+        t = array.get(down_targs, i)
+        if not showHist and not na(t.ln)
+            line.delete(t.ln)
+        if not na(t.lab)
+            label.delete(t.lab)
+    array.clear(up_targs)
+    array.clear(down_targs)
+
+    // delete previous shapes if not keeping history
+    if not showHist
+        if not na(or_bx)
+            box.delete(or_bx)
+        if not na(h_ln.ln)
+            line.delete(h_ln.ln)
+        if not na(l_ln.ln)
+            line.delete(l_ln.ln)
+        if not na(m_ln)
+            line.delete(m_ln)
+        // also clear historical signal labels
+        for i = 0 to array.size(signals)-1
+            lab = array.get(signals, i)
+            if not na(lab)
+                label.delete(lab)
+        array.clear(signals)
+
+    // init OR
+    orh := high
+    orl := low
+    prev_orm := orm[1]
+    up_count := 0
+    down_count := 0
+    up_check := true
+    down_check := true
+    or_bx := box.new(left=bar_index, top=high, right=bar_index, bottom=low, bgcolor=orFillColor, border_width=0)
+    or_token := false
+    // session start timestamp for "no new after"
+    if orMode == "Custom Window"
+        sessStartTs := time
+
+//=====================================================================
+// While OR session active
+//=====================================================================
+if or_sesh
+    orh := math.max(high, nz(orh, high))
+    orl := math.min(low,  nz(orl,  low))
+    if showBox and not na(or_bx)
+        box.set_top(or_bx, orh)
+        box.set_bottom(or_bx, orl)
+        box.set_right(or_bx, bar_index)
+    if orh != orl
+        or_token := true
+
+//=====================================================================
+// On OR end: finalize levels, targets, bias fill color
+//=====================================================================
+if or_end and or_token
+    // level lines + labels
+    h_ln := target.new(
+        line.new(bar_index, orh, bar_index, orh, color=lvlColor),
+        label.new(bar_index, orh, text="ORH", tooltip=str.tostring(orh, format.mintick),
+                  style=label.style_label_left, color=invis, textcolor=lvlColor, size=sigSizeStr))
+    l_ln := target.new(
+        line.new(bar_index, orl, bar_index, orl, color=lvlColor),
+        label.new(bar_index, orl, text="ORL", tooltip=str.tostring(orl, format.mintick),
+                  style=label.style_label_left, color=invis, textcolor=lvlColor, size=sigSizeStr))
+    m_ln := line.new(bar_index, math.avg(orh,orl), bar_index, math.avg(orh,orl), style=line.style_dashed, color=lvlColor)
+
+    // first target anchors (visual engine)
+    hst := orh + (math.abs(orh - orl) * tPer)
+    lst := orl - (math.abs(orh - orl) * tPer)
+
+    // daily bias direction (OR mid vs previous OR mid)
+    orm_now = math.avg(orh, orl)
+    day_dir := orm_now > prev_orm ? 1 : orm_now < prev_orm ? -1 : 0
+
+    // bias fill between ORH and ORL
+    linefill.new(h_ln.ln, l_ln.ln, day_dir == 1 ? boxColorBull : day_dir == -1 ? boxColorBear : color.new(color.black, 100))
+
+//=====================================================================
+// Outside OR session: extend lines to the right
+//=====================================================================
+if not or_sesh and or_token
+    if not na(h_ln.ln)
+        line.set_x2(h_ln.ln, bar_index)
+        label.set_x(h_ln.lab, bar_index)
+    if not na(l_ln.ln)
+        line.set_x2(l_ln.ln, bar_index)
+        label.set_x(l_ln.lab, bar_index)
+    if not na(m_ln)
+        line.set_x2(m_ln, bar_index)
+
+//=====================================================================
+// Target engine (visual UDTs)
+//=====================================================================
+h_src = tSrc == "Close" ? close : high
+l_src = tSrc == "Close" ? close : low
+
+if h_src > nz(hst)
+    hst := h_src
+if l_src < nz(lst)
+    lst := l_src
+
+up_max   = orw > 0 ? get_1up((hst - orh) / (orw * tPer)) : 0
+down_max = orw > 0 ? get_1up((orl - lst) / (orw * tPer)) : 0
+
+up_cur   = orw > 0 ? math.max(0, get_1up((h_src - orh) / (orw * tPer))) : 0
+down_cur = orw > 0 ? math.max(0, get_1up((orl - l_src) / (orw * tPer))) : 0
+
+// Add missing targets
+if not or_sesh and or_token and tTog
+    // style
+    lstyle = linestyle(tStyleStr)
+    // Up targets
+    if up_count < up_max
+        for i = (up_count + 1) to up_max
+            y = orh + orw * tPer * i
+            ln = line.new(bar_index-1, y, bar_index, y, color=color.new(#089981,60), style=lstyle)
+            lb = label.new(bar_index, y, text=str.tostring(i), tooltip=str.tostring(y, format.mintick),
+                           style=label.style_label_left, color=invis, textcolor=color.new(#089981,0), size=sigSizeStr)
+            array.push(up_targs, target.new(ln, lb))
+            if i == up_max
+                up_count := up_max
+    // Down targets
+    if down_count < down_max
+        for i = (down_count + 1) to down_max
+            y = orl - orw * tPer * i
+            ln = line.new(bar_index-1, y, bar_index, y, color=color.new(#f23645,60), style=lstyle)
+            lb = label.new(bar_index, y, text=str.tostring(i), tooltip=str.tostring(y, format.mintick),
+                           style=label.style_label_left, color=invis, textcolor=color.new(#f23645,0), size=sigSizeStr)
+            array.push(down_targs, target.new(ln, lb))
+            if i == down_max
+                down_count := down_max
+
+// Extend/Adapt targets
+if tTog and tDispType == "Extended"
+    for i = 0 to array.size(up_targs)-1
+        ln = array.get(up_targs, i).ln
+        lb = array.get(up_targs, i).lab
+        line.set_x2(ln, bar_index)
+        label.set_x(lb, bar_index)
+    for i = 0 to array.size(down_targs)-1
+        ln = array.get(down_targs, i).ln
+        lb = array.get(down_targs, i).lab
+        line.set_x2(ln, bar_index)
+        label.set_x(lb, bar_index)
+
+if tTog and tDispType == "Adaptive"
+    // show 2 bands around current progress
+    for i = 0 to array.size(up_targs)-1
+        tg = array.get(up_targs, i)
+        y1 = line.get_y1(tg.ln)
+        showBand = y1 <= (orh + (orw*tPer*up_cur)) and y1 >= (orh + (orw*tPer*(up_cur-2)))
+        if showBand
+            line.set_x2(tg.ln, bar_index+1)
+            label.set_x(tg.lab, bar_index+1)
+    for i = 0 to array.size(down_targs)-1
+        tg = array.get(down_targs, i)
+        y1 = line.get_y1(tg.ln)
+        showBand = y1 <= (orl - (orw*tPer*(down_cur-0))) and y1 >= (orl - (orw*tPer*(down_cur-2)))
+        if showBand
+            line.set_x2(tg.ln, bar_index+1)
+            label.set_x(tg.lab, bar_index+1)
+
+//=====================================================================
+// Signals for labels (visual only, optional)
+//=====================================================================
+if orw > 0
+    if (close > orm and not down_check)
+        down_check := true
+    xdown  = ta.crossunder(close, orl)
+    xdown2 = ta.crossunder(close, orl - orw*tPer)
+    allowDn = biasMode == "No Bias" ? xdown : ((day_dir != 1 and xdown) or (day_dir == 1 and xdown2))
+    if allowDn and down_check
+        down_signal := true
+        down_check  := false
+
+    if (close < orm and not up_check)
+        up_check := true
+    xup  = ta.crossover(close, orh)
+    xup2 = ta.crossover(close, orh + orw*tPer)
+    allowUp = biasMode == "No Bias" ? xup : ((day_dir != -1 and xup) or (day_dir == -1 and xup2))
+    if allowUp and up_check
+        up_signal := true
+        up_check  := false
+
+// draw signal labels if enabled
+if showLabs and up_signal
+    array.push(signals, label.new(bar_index, nz(orl, close), text="\n▲", style=label.style_label_center, color=invis, textcolor=upSigColor, size=sigSizeStr))
+if showLabs and down_signal
+    array.push(signals, label.new(bar_index, nz(orh, close), text="▼\n", style=label.style_label_center, color=invis, textcolor=downSigColor, size=sigSizeStr))
+
+//=====================================================================
+// Filters & Breakout triggers for TRADING
+//=====================================================================
+
+// Compute ATR band
+atrVal = ta.atr(atrLen)
+atrOK  = not useATR or (orw > 0 and atrVal > 0 and orw/atrVal >= minATRm and orw/atrVal <= maxATRm)
+
+// Volume filter (robust)
+v = nz(volume)
+smaVol = ta.sma(v, volLen)
+volOK  = not useVol or (v >= smaVol * volMult and (minAbsVol == 0 or v >= minAbsVol))
+
+// Trend filter (if enabled)
+emaVal = ta.ema(close, emaLen)
+trendLongOK  = not useTrend or close >= emaVal
+trendShortOK = not useTrend or close <= emaVal
+
+// Breakout methods
+closeUp  = not na(orh) and close > orh and close[1] <= orh
+closeDn  = not na(orl) and close < orl and close[1] >= orl
+wickUp   = not na(orh) and high  > orh and high[1]  <= orh
+wickDn   = not na(orl) and low   < orl and low[1]   >= orl
+retestUp = orw > 0 and ta.lowest(low,  retestBars)[1] >= orh - retestTol * orw
+retestDn = orw > 0 and ta.highest(high, retestBars)[1] <= orl + retestTol * orw
+
+longTrig  = brkMethod == "Close"    ? closeUp
+        :  brkMethod == "High/Low" ? wickUp
+        :                            (closeUp and retestUp)
+shortTrig = brkMethod == "Close"    ? closeDn
+        :  brkMethod == "High/Low" ? wickDn
+        :                            (closeDn and retestDn)
+
+// Skip N bars after OR lock
+lockedBarIndex = ta.valuewhen(or_end, bar_index, 0)
+okAfterSkip = not na(lockedBarIndex) and (bar_index - lockedBarIndex > skipBars)
+
+// Bias gating for trading (simplified, mirrors label logic)
+allowLongBias  = biasMode == "No Bias" or day_dir != -1 or (orw > 0 and close >= orh + orw*tPer)
+allowShortBias = biasMode == "No Bias" or day_dir !=  1 or (orw > 0 and close <= orl - orw*tPer)
+
+// “No new entries after” cutoff (mins from session/custom start)
+noNewNow = not na(sessStartTs) and time > (sessStartTs + noNewAfterMins * 60000)
+
+// One-trade-per-day lockout
+var bool tradedToday = false
+newDay = ta.change(time("D")) != 0
+if newDay or newSess or (orMode == "Custom Window" and or_start)
+    tradedToday := false
+
+// Final permissions
+baseLong  = or_end and okAfterSkip and longTrig  and atrOK and volOK and trendLongOK and allowLongBias
+baseShort = or_end and okAfterSkip and shortTrig and atrOK and volOK and trendShortOK and allowShortBias
+
+canLong  = baseLong  and (not onePerDay or not tradedToday) and not noNewNow
+canShort = baseShort and (not onePerDay or not tradedToday) and not noNewNow
+
+//=====================================================================
+// Risk-based sizing & Orders
+//=====================================================================
+qtyFromRisk(stopDist) =>
+    sd = stopDist
+    if na(sd) or sd <= 0
+        0.0
+    else
+        riskCash    = strategy.equity * (maxRiskPct / 100.0)
+        rawQty      = riskCash / sd
+        notionalCap = strategy.equity * (maxNotional / 100.0)
+        capQty      = notionalCap / close
+        math.floor(math.min(rawQty, capQty))
+
+// Stop distance = OR width (1R)
+stopDist = orw
+qtyTotal = qtyFromRisk(stopDist)
+qty1     = math.floor(qtyTotal * (qtyT1pct / 100.0))
+qty2     = math.max(qtyTotal - qty1, 0)
+
+// Entries (split lots)
+if canLong and qty1 > 0 and qty2 > 0 and stopDist > 0
+    strategy.entry("L1", strategy.long, qty=qty1)
+    strategy.entry("L2", strategy.long, qty=qty2)
+    tradedToday := onePerDay ? true : tradedToday
+    if showLabs
+        array.push(signals, label.new(bar_index, orl, text="\n▲", style=label.style_label_center, color=invis, textcolor=upSigColor, size=sigSizeStr))
+
+if canShort and qty1 > 0 and qty2 > 0 and stopDist > 0
+    strategy.entry("S1", strategy.short, qty=qty1)
+    strategy.entry("S2", strategy.short, qty=qty2)
+    tradedToday := onePerDay ? true : tradedToday
+    if showLabs
+        array.push(signals, label.new(bar_index, orh, text="▼\n", style=label.style_label_center, color=invis, textcolor=downSigColor, size=sigSizeStr))
+
+//=====================================================================
+// Exits, BE-after-T1, Time stop
+//=====================================================================
+var bool longBE = false
+var bool shrtBE = false
+var int  entryTime = na
+
+if strategy.position_size == 0
+    longBE := false
+    shrtBE := false
+    entryTime := na
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avgPx   = strategy.position_avg_price
+
+// Timestamp when in position
+if strategy.position_size != 0 and na(entryTime)
+    entryTime := time
+
+// Time stop (flatten)
+timeStopHit = useTimeStop and not na(entryTime) and (time - entryTime >= timeStopMin * 60000)
+if timeStopHit
+    strategy.close_all(comment="TimeStop")
+
+// Long side
+if inLong and stopDist > 0
+    hitT1 = high >= avgPx + t1R * stopDist
+    if beAfterT1 and hitT1
+        longBE := true
+    stopL = longBE ? avgPx : avgPx - stopDist
+    tp1L  = avgPx + t1R * stopDist
+    tp2L  = avgPx + t2R * stopDist
+    strategy.exit("XL1", from_entry="L1", stop=stopL, limit=tp1L, comment="T1/Stop")
+    strategy.exit("XL2", from_entry="L2", stop=stopL, limit=tp2L, comment="T2/Stop")
+
+// Short side
+if inShort and stopDist > 0
+    hitT1s = low <= avgPx - t1R * stopDist
+    if beAfterT1 and hitT1s
+        shrtBE := true
+    stopS = shrtBE ? avgPx : avgPx + stopDist
+    tp1S  = avgPx - t1R * stopDist
+    tp2S  = avgPx - t2R * stopDist
+    strategy.exit("XS1", from_entry="S1", stop=stopS, limit=tp1S, comment="T1/Stop")
+    strategy.exit("XS2", from_entry="S2", stop=stopS, limit=tp2S, comment="T2/Stop")
+
+//=====================================================================
+// Visuals: OR levels & mid (guides)
+//=====================================================================
+if showLvls and not na(orh) and not na(orl)
+    plot(orh, "OR High", color=color.new(#00FF00, 0), linewidth=2)
+    plot(orl, "OR Low",  color=color.new(#FF0000, 0), linewidth=2)
+    plot(math.avg(orh,orl), "OR Mid", color=color.new(color.gray, 0), style=plot.style_circles)
+
+// Session MA (resets on OR start)
+maVal = day_ma(or_start, maType, close, maLen)
+plot(or_start ? na : maVal, style=plot.style_linebr, color=maColor,
+     display=maTog ? display.all : display.none, title="Session MA", editable=false)
