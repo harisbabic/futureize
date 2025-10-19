@@ -1,0 +1,461 @@
+Perfect—here are the four pieces exactly as we’d run them. Copy/paste as-is.
+
+⸻
+
+One-time assumptions
+	•	Advanced Hotkeys ON (Setup → Other Configuration).
+	•	Windows named MainMont (montage) and MainChart (chart), same link color.
+	•	Test in SIM with TIF=DAY+.
+
+⸻
+
+1) HOT BUTTON — ARM Breakout (Strict + Guardrails)
+
+(arms a prior-bar breakout; strict abort on break of low; guardrails for spread/slippage/hold/timeout; synthetic stop + BE hop)
+
+/* === TUNE THESE === */
+$UseRisk   = true;     // true: size by $RiskAmt; false: fixed shares
+$RiskAmt   = 50;       // dollars risk if UseRisk=true
+$FixedSh   = 200;      // shares if UseRisk=false
+$EntryBuf  = 0.01;     // trigger = prev high + 0.01
+$StopBuf   = 0.03;     // synthetic stop base = prev low - 0.03
+$BeDelta   = 0.15;     // hop stop to BE once +$0.15
+$BeCush    = 0.00;     // set 0.01 if you want BE+1c
+$BuyAgg    = 0.05;     // entry limit = max(Bid+0.05, entry)
+$ExitAgg   = 0.05;     // exit limit (synthetic stop fill) = Bid-0.05
+$MaxSpread = 0.06;     // don't fire if spread > 6c
+$SlipMax   = 0.03;     // cap entry slippage to +3c above trigger
+$HoldSec   = 2;        // must hold above trigger for 2s before entry
+$MaxAge    = 180;      // disarm after 180s if no trigger
+$MaxSh     = 6000;     // absolute share cap
+$MaxNotion = 20000;    // notional cap ($)
+/* =================== */
+
+$M=GetWindowObj("MainMont");
+$C=GetWindowObj("MainChart");
+
+// previous finished candle
+$bar=$C.GetBar(-1); $hi=Round($bar.HI,2); $lo=Round($bar.LO,2);
+
+$entry=Round($hi+$EntryBuf,2);
+$stop0=Round($lo-$StopBuf,2);
+$rps  =Max($entry-$stop0,0.01);
+
+// refuse to arm if we're already outside range (strict)
+if ($M.LAST <= $lo) { Speak("Not armed: below prev low "+$lo); return; }
+if ($M.LAST >= $entry) { Speak("Not armed: already through "+$entry); return; }
+
+// shares
+$sh=0; if ($UseRisk) { $sh=Round($RiskAmt/$rps,0); } else { $sh=$FixedSh; }
+$sh=Max($sh,1);
+// caps
+if ($sh > $MaxSh) { $sh=$MaxSh; }
+if ($sh*$entry > $MaxNotion) { $sh=Round($MaxNotion/$entry,0); $sh=Max($sh,1); }
+
+// hand state to Timer
+SetVar("PM_mode","BRK");
+SetVar("PM_sym",$M.SYMB);
+SetVar("PM_entry",$entry);
+SetVar("PM_stopInit",$stop0);
+SetVar("PM_sh",$sh);
+SetVar("PM_state","ARMED");       // ARMED -> SENT -> IN -> DONE
+SetVar("PM_beDelta",$BeDelta);
+SetVar("PM_beCush",$BeCush);
+SetVar("PM_buyAgg",$BuyAgg);
+SetVar("PM_exitAgg",$ExitAgg);
+SetVar("PM_maxSpr",$MaxSpread);
+SetVar("PM_slipMax",$SlipMax);
+SetVar("PM_holdReq",$HoldSec);
+SetVar("PM_maxAge",$MaxAge);
+SetVar("PM_hold",0);
+SetVar("PM_age",0);
+
+Speak("Armed breakout: entry "+$entry+" stop "+$stop0+" shares "+$sh);
+
+
+⸻
+
+2) HOT BUTTON — ARM Pullback Join (prior-bar mid)
+
+(drops a buy-limit at prior-bar midpoint; strict abort if break of that bar’s low before fill; same synthetic stop + BE hop; same guardrails/timeouts)
+
+/* === TUNE THESE (can match Breakout) === */
+$UseRisk   = true;
+$RiskAmt   = 50;
+$FixedSh   = 200;
+$StopBuf   = 0.03;     // stop base = that bar's low - 0.03
+$BeDelta   = 0.15;
+$BeCush    = 0.00;
+$ExitAgg   = 0.05;     // exit limit = Bid-0.05
+$MaxSpread = 0.06;     // spread filter at arming time
+$MaxAge    = 180;      // cancel after 180s if no fill
+$MaxSh     = 6000;
+$MaxNotion = 20000;
+/* =================== */
+
+$M=GetWindowObj("MainMont");
+$C=GetWindowObj("MainChart");
+
+// previous finished candle
+$bar=$C.GetBar(-1); 
+$hi=Round($bar.HI,2); $lo=Round($bar.LO,2);
+$mid=Round(($hi+$lo)/2, 2);
+
+$entry=$mid;                               // join price = prior-bar mid
+$stop0=Round($lo-$StopBuf,2);
+$rps  =Max($entry-$stop0,0.01);
+
+// refuse if already below low
+if ($M.LAST <= $lo) { Speak("Not armed: below prev low "+$lo); return; }
+
+// shares
+$sh=0; if ($UseRisk) { $sh=Round($RiskAmt/$rps,0); } else { $sh=$FixedSh; }
+$sh=Max($sh,1);
+// caps
+if ($sh > $MaxSh) { $sh=$MaxSh; }
+if ($sh*$entry > $MaxNotion) { $sh=Round($MaxNotion/$entry,0); $sh=Max($sh,1); }
+
+// spread filter on arm
+$spr = Round($M.ASK - $M.BID, 2);
+if ($spr > $MaxSpread) { Speak("Not armed: spread "+$spr+" > "+$MaxSpread); return; }
+
+// send working limit NOW
+NewOrderObj("B "+$sh+" "+$M.SYMB+" L D+").Set(Price,$entry).Send();
+
+// hand state to Timer
+SetVar("PM_mode","JOIN");
+SetVar("PM_sym",$M.SYMB);
+SetVar("PM_entry",$entry);
+SetVar("PM_stopInit",$stop0);
+SetVar("PM_sh",$sh);
+SetVar("PM_state","SENT");          // order is already working
+SetVar("PM_beDelta",$BeDelta);
+SetVar("PM_beCush",$BeCush);
+SetVar("PM_exitAgg",$ExitAgg);
+SetVar("PM_maxSpr",$MaxSpread);
+SetVar("PM_maxAge",$MaxAge);
+SetVar("PM_age",0);
+
+Speak("Armed pullback join: limit "+$entry+" stop "+$stop0+" shares "+$sh);
+
+
+⸻
+
+3) Timer Event — single manager for both modes
+
+(paste this entire script in Timer Event; it handles BRK & JOIN, strict aborts, BE hop, timeout, spread/slip/hold)
+
+$M=GetWindowObj("MainMont");
+$sym=GetVar("PM_sym"); if ($sym=="" || $M.SYMB!=$sym) { return; }
+
+$mode   = GetVar("PM_mode");
+$state  = GetVar("PM_state"); if ($state=="") { return; }
+$entry  = GetVar("PM_entry");
+$stop0  = GetVar("PM_stopInit");
+$sh     = Round(GetVar("PM_sh"),0);
+$beDel  = GetVar("PM_beDelta");
+$beCush = GetVar("PM_beCush");
+$buyAgg = GetVar("PM_buyAgg");      // only for BRK
+$exitAgg= GetVar("PM_exitAgg");
+$maxSpr = GetVar("PM_maxSpr");
+$slipMx = GetVar("PM_slipMax");     // only for BRK
+$holdRq = GetVar("PM_holdReq");     // only for BRK
+$age    = GetVar("PM_age");
+
+// --------------- COMMON strict abort ---------------
+if ($state=="ARMED" || $state=="SENT") {
+    if ($M.LAST > 0 && $M.LAST <= $stop0) {
+        Exec("CXL ALLSYMB;"); SetVar("PM_state","DONE"); Speak("Aborted: broke low"); return;
+    }
+}
+
+// --------------- MODE: BREAKOUT --------------------
+if ($mode=="BRK") {
+
+  if ($state=="ARMED") {
+      // spread
+      $spr = Round($M.ASK - $M.BID, 2);
+      if ($spr > $maxSpr) { SetVar("PM_age",$age+1); return; }
+
+      // timeout
+      if ($age >= GetVar("PM_maxAge")) { SetVar("PM_state","DONE"); Speak("Disarmed: timed out"); return; }
+
+      // hold-above confirm
+      if ($M.LAST >= $entry) {
+          $h = GetVar("PM_hold")+1; SetVar("PM_hold",$h);
+          if ($h >= $holdRq) {
+              // price with slippage cap
+              $px = Round($M.BID + $buyAgg, 2); if ($px < $entry) { $px = $entry; }
+              $cap= Round($entry + $slipMx, 2); if ($px > $cap)   { $px = $cap;   }
+              NewOrderObj("B "+$sh+" "+$sym+" L D+").Set(Price,$px).Send();
+              SetVar("PM_state","SENT"); Speak("Breakout sent"); return;
+          }
+      } else {
+          SetVar("PM_hold",0);
+      }
+
+      // age tick
+      SetVar("PM_age",$age+1);
+      return;
+  }
+
+  if ($state=="SENT") {
+      if ($M.POS>0) { SetVar("PM_state","IN"); SetVar("PM_stopLive",$stop0); Speak("Filled"); return; }
+      // still working: age/timeout
+      $age = GetVar("PM_age")+1; SetVar("PM_age",$age);
+      if ($age >= GetVar("PM_maxAge")) { Exec("CXL ALLSYMB;"); SetVar("PM_state","DONE"); Speak("Canceled: timed out"); }
+      return;
+  }
+}
+
+// --------------- MODE: JOIN (pullback) -------------
+if ($mode=="JOIN") {
+  if ($state=="SENT") {
+      if ($M.POS>0) { SetVar("PM_state","IN"); SetVar("PM_stopLive",$stop0); Speak("Filled"); return; }
+      // timeout while waiting
+      $age = GetVar("PM_age")+1; SetVar("PM_age",$age);
+      if ($age >= GetVar("PM_maxAge")) { Exec("CXL ALLSYMB;"); SetVar("PM_state","DONE"); Speak("Canceled: timed out"); }
+      return;
+  }
+}
+
+// --------------- IN: synthetic stop + BE hop -------
+if ($state=="IN") {
+    if (GetVar("PM_beDone")!=1 && $M.LAST >= Round($M.AvgCost+$beDel,2)) {
+        SetVar("PM_stopLive", Round($M.AvgCost+$beCush,2)); SetVar("PM_beDone",1);
+        Speak("Stop to break even");
+    }
+    $live=GetVar("PM_stopLive");
+    if ($M.LAST > 0 && $M.LAST <= $live) {
+        $px = Round($M.BID - $exitAgg, 2);
+        NewOrderObj("S "+$M.POS+" "+$sym+" L D+").Set(Price,$px).Send();
+        SetVar("PM_state","DONE"); Speak("Stopped");
+        return;
+    }
+}
+
+// --------------- Cleanup if flat -------------------
+if ($M.POS==0 && ($state=="IN" || $state=="SENT")) { SetVar("PM_state","DONE"); }
+
+
+⸻
+
+3) MANUAL ASSISTS (make 4 separate buttons)
+
+A) Flatten NOW (aggressive limit)
+
+$M=GetWindowObj("MainMont"); $ExitAgg=0.05;
+NewOrderObj("S "+$M.POS+" "+$M.SYMB+" L D+").Set(Price, Round($M.BID-$ExitAgg,2)).Send();
+
+B) Cancel ALL (this symbol)
+
+Exec("CXL ALLSYMB;");
+
+C) Move Stop → Break-Even
+
+$M=GetWindowObj("MainMont"); $BeCush=0.00;  // set 0.01 for BE+1c
+SetVar("PM_stopLive", Round($M.AvgCost+$BeCush,2)); Speak("Synthetic stop set to BE");
+
+D) Move Stop → Last Bar Low − 3¢ (ratchet only up)
+
+$M=GetWindowObj("MainMont"); $C=GetWindowObj("MainChart"); $Buf=0.03;
+$prev=$C.GetBar(-1); $new=Round($prev.LO-$Buf,2);
+$cur=GetVar("PM_stopLive"); if ($cur==0) { $cur=$new; }
+if ($new > $cur) { SetVar("PM_stopLive",$new); Speak("Stop raised to "+$new); } else { Speak("No raise (would lower)"); }
+
+
+⸻
+
+4) Emergency OUT (Market)
+
+(full-position, market; fastest exit)
+
+Exec("ROUTE=MARKET; TIF=DAY+; Share=Pos; SELL=Send;");
+
+Optional: add a true Panic button that liquidates the selected account across all symbols:
+Panic;
+
+⸻
+
+Quick test flow (SIM)
+	1.	Paste Timer Event in full; Apply.
+	2.	Add the two ARM buttons (Breakout + Join) and the 4 assists + Emergency OUT.
+	3.	SIM account selected, TIF=DAY+.
+	4.	Try ARM Breakout on a 1-min chart; watch the speech and Orders/Trades windows.
+	5.	Try ARM Pullback Join; you should see the working limit immediately; watch timeout/abort behavior.
+
+If you want a “Move stop to prior bar low every time a bar closes” automation, I can add a trailing module that only ratchets upward (hands-free) without spamming orders.
+
+----
+
+Great instinct. A “spike-protect” auto-partial can save you from those one-and-done wicks. I’d use it — but with tight guardrails so it only fires on a true burst, not every clean breakout.
+
+Below is a drop-in update that adds a fast ½-position take if price surges right after fill. I’m giving you (A) two tiny edits to both ARM buttons to seed the new settings, and (B) a full Timer Event (manager) replacement that implements the logic.
+
+⸻
+
+A) Add these lines to BOTH ARM buttons (Breakout & Pullback)
+
+Place these after the other SetVar(...) lines in each ARM script:
+
+/* ---- spike-protect settings ---- */
+SetVar("PM_spikeOn",        1);     // 1=enable, 0=disable
+SetVar("PM_spikePct",       0.15);  // +15% vs AvgCost triggers OR...
+SetVar("PM_spikeAbs",       0.30);  // +$0.30 vs AvgCost triggers (whichever is HIGHER)
+SetVar("PM_spikeWin",       5);     // must happen within 5s of fill
+SetVar("PM_spikeHalf",      50);    // sell 50% of current position
+SetVar("PM_spikeLocksBE",   1);     // after partial, lock stop to BE (+cush)
+SetVar("PM_spikeDone",      0);     // reset flag
+SetVar("PM_inAge",          0);     // age since fill (seconds)
+
+Tuning: For $2–$8 names, 15% or $0.30 is a good “this is a spike” first pass. If you want it more sensitive, try 0.10 and $0.20.
+
+⸻
+
+B) Timer Event — FULL replacement (includes spike-protect)
+
+Paste this entire script into Timer Event (replaces your manager). It supports both modes (Breakout & Pullback), strict abort on break of low, spread/slippage/hold, BE hop — and the spike auto-partial.
+
+$M=GetWindowObj("MainMont");
+$sym=GetVar("PM_sym"); if ($sym=="" || $M.SYMB!=$sym) { return; }
+
+$mode   = GetVar("PM_mode");
+$state  = GetVar("PM_state"); if ($state=="") { return; }
+$entry  = GetVar("PM_entry");
+$stop0  = GetVar("PM_stopInit");
+$sh     = Round(GetVar("PM_sh"),0);
+$beDel  = GetVar("PM_beDelta");
+$beCush = GetVar("PM_beCush");
+$buyAgg = GetVar("PM_buyAgg");       // BRK only
+$exitAgg= GetVar("PM_exitAgg");
+$maxSpr = GetVar("PM_maxSpr");
+$slipMx = GetVar("PM_slipMax");      // BRK only
+$holdRq = GetVar("PM_holdReq");      // BRK only
+$age    = GetVar("PM_age");
+
+/* ---- spike-protect vars ---- */
+$spOn   = GetVar("PM_spikeOn");
+$spPct  = GetVar("PM_spikePct");
+$spAbs  = GetVar("PM_spikeAbs");
+$spWin  = GetVar("PM_spikeWin");
+$spHalf = GetVar("PM_spikeHalf");
+$spLock = GetVar("PM_spikeLocksBE");
+$spDone = GetVar("PM_spikeDone");
+$inAge  = GetVar("PM_inAge");
+
+/* ---------- COMMON strict abort before entry ---------- */
+if ($state=="ARMED" || $state=="SENT") {
+    if ($M.LAST > 0 && $M.LAST <= $stop0) {
+        Exec("CXL ALLSYMB;"); SetVar("PM_state","DONE"); Speak("Aborted: broke low"); return;
+    }
+}
+
+/* -------------------- BREAKOUT MODE ------------------- */
+if ($mode=="BRK") {
+
+  if ($state=="ARMED") {
+      // spread filter
+      $spr = Round($M.ASK - $M.BID, 2);
+      if ($spr > $maxSpr) { SetVar("PM_age",$age+1); return; }
+
+      // timeout
+      if ($age >= GetVar("PM_maxAge")) { SetVar("PM_state","DONE"); Speak("Disarmed: timed out"); return; }
+
+      // hold-above confirm
+      if ($M.LAST >= $entry) {
+          $h = GetVar("PM_hold")+1; SetVar("PM_hold",$h);
+          if ($h >= $holdRq) {
+              // entry price with slippage cap
+              $px = Round($M.BID + $buyAgg, 2); if ($px < $entry) { $px = $entry; }
+              $cap= Round($entry + $slipMx, 2); if ($px > $cap)   { $px = $cap;   }
+              NewOrderObj("B "+$sh+" "+$sym+" L D+").Set(Price,$px).Send();
+              SetVar("PM_state","SENT"); Speak("Breakout sent"); return;
+          }
+      } else {
+          SetVar("PM_hold",0);
+      }
+
+      // age tick
+      SetVar("PM_age",$age+1);
+      return;
+  }
+
+  if ($state=="SENT") {
+      if ($M.POS>0) { SetVar("PM_state","IN"); SetVar("PM_stopLive",$stop0); SetVar("PM_inAge",0); Speak("Filled"); return; }
+      $age = GetVar("PM_age")+1; SetVar("PM_age",$age);
+      if ($age >= GetVar("PM_maxAge")) { Exec("CXL ALLSYMB;"); SetVar("PM_state","DONE"); Speak("Canceled: timed out"); }
+      return;
+  }
+}
+
+/* -------------------- PULLBACK JOIN ------------------- */
+if ($mode=="JOIN") {
+  if ($state=="SENT") {
+      if ($M.POS>0) { SetVar("PM_state","IN"); SetVar("PM_stopLive",$stop0); SetVar("PM_inAge",0); Speak("Filled"); return; }
+      $age = GetVar("PM_age")+1; SetVar("PM_age",$age);
+      if ($age >= GetVar("PM_maxAge")) { Exec("CXL ALLSYMB;"); SetVar("PM_state","DONE"); Speak("Canceled: timed out"); }
+      return;
+  }
+}
+
+/* --------------- IN: stop/BE + spike-protect ---------- */
+if ($state=="IN") {
+    // age since fill (1 tick ~= 1s)
+    SetVar("PM_inAge", $inAge + 1);
+
+    // 1) spike-protect: fast auto partial within window
+    if ($spOn==1 && $spDone!=1 && $inAge <= $spWin) {
+        $thr1 = Round($M.AvgCost * (1 + $spPct), 2);
+        $thr2 = Round($M.AvgCost + $spAbs, 2);
+        $thr  = Max($thr1, $thr2);
+        if ($M.LAST >= $thr) {
+            $q = Max(Round($M.POS * ($spHalf/100.0), 0), 1);
+            // use immediate limit at current bid
+            NewOrderObj("S "+$q+" "+$sym+" L D+").Set(Price, Round($M.BID,2)).Send();
+            SetVar("PM_spikeDone",1);
+            if ($spLock==1) {
+                // lock stop to BE (+cush) right after partial
+                SetVar("PM_stopLive", Round($M.AvgCost + $beCush, 2));
+                SetVar("PM_beDone", 1);  // prevent later BE hop from re-firing
+            }
+            Speak("Spike partial sent");
+        }
+    }
+
+    // 2) standard BE hop when +$beDel (if not already done by spike lock)
+    if (GetVar("PM_beDone")!=1 && $M.LAST >= Round($M.AvgCost+$beDel,2)) {
+        SetVar("PM_stopLive", Round($M.AvgCost+$beCush,2)); SetVar("PM_beDone",1);
+        Speak("Stop to break even");
+    }
+
+    // 3) synthetic stop check
+    $live=GetVar("PM_stopLive");
+    if ($M.LAST > 0 && $M.LAST <= $live) {
+        $px = Round($M.BID - $exitAgg, 2);
+        NewOrderObj("S "+$M.POS+" "+$sym+" L D+").Set(Price,$px).Send();
+        SetVar("PM_state","DONE"); Speak("Stopped");
+        return;
+    }
+}
+
+/* ----------------- Cleanup if flat -------------------- */
+if ($M.POS==0 && ($state=="IN" || $state=="SENT")) { SetVar("PM_state","DONE"); }
+
+
+⸻
+
+Should you auto-partial on every fill?
+	•	For pure breakouts, I wouldn’t sell half immediately; it clips your best trades.
+	•	For the wick-risk case you described, a conditional, fast partial within a short window is ideal: it only fires on a true burst, then you’re safe even if it mean-reverts.
+
+Limits / reality check
+	•	The manager ticks ~1s; a millisecond wick can be missed. That’s why we use a generous spike trigger (+15%/$0.30) and a window (e.g., 5s). If you can lower the timer interval in your DAS build, do it — but keep it stable to avoid order-spam.
+	•	In thin after-hours, consider making the partial market if you really need certainty:
+
+Exec("ROUTE=MARKET; TIF=DAY+; Share="+Max(Round($M.POS*0.5,0),1)+"; SELL=Send;");
+
+It’ll fill but might slip; I prefer the limit at Bid above.
+
+⸻
+
+If you want, I can also give you a “spike-only” ARM button (disables BE hop until after the partial), or wire the partial to 1R instead of a fast spike. Your call.
