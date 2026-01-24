@@ -1,0 +1,297 @@
+//@version=6
+// File: indicators/HxB_MACD_ATR_v5.4_DI_RSI_SellBuffer_Normalized_Debug.pine
+// Purpose: MACD-first + confirmations with adaptive/normalized buffers.
+//          v5.4 FIX: BuyBuffer and SlowProx gates now scale off macdScale = EMA(|fastMACD|),
+//                    NOT histScale (EMA(|histFast|)). This makes Buy Buffer % actually move signals.
+//          Keeps: DI trend + DI spread percentile, ADX two-regime gate, RSI, sell hysteresis, debug.
+
+indicator("HxB MACD v5.4 (Normalized + Debug - BuyBuffer FIX)", "MACDv5.4", overlay=true, max_labels_count=500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS
+//──────────────────────────────────────────────────────────────────────────────
+src = input.source(close, "Source")
+
+// Fast MACD
+fastFastLen = input.int(3, "Fast MACD: Fast Len (Blue)", minval=1)
+fastSlowLen = input.int(9, "Fast MACD: Slow Len", minval=1)
+fastSigLen  = input.int(5, "Fast MACD: Signal Len (Orange)", minval=1)
+
+// Slow MACD (reference)
+slowFastLen = input.int(12, "Slow MACD: Fast Len", minval=1)
+slowSlowLen = input.int(26, "Slow MACD: Slow Len", minval=1)
+slowSigLen  = input.int(9,  "Slow MACD: Signal Len (Slow SIG)", minval=1)
+
+// Signal behavior
+oneSignalPerTrade = input.bool(true, "One Confirmed Buy per Trade (recommended)")
+triggerOnClose    = input.bool(false, "Trigger Signals On Bar Close (recommended)")
+
+// Visuals
+showBG    = input.bool(true, "Shade Background While In Trade")
+bgOpacity = input.int(98, "BG Opacity (0 solid → 100 off)", minval=0, maxval=100)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DI/ADX Gate (Modular + Debuggable)
+//──────────────────────────────────────────────────────────────────────────────
+useDiAdxGate = input.bool(true,  "Gate: DI/ADX (modular)")
+
+useDiTrendGate     = input.bool(true, "DI Gate: require DI+ > DI-")
+useSpreadPctGate   = input.bool(true, "DI Gate: require diSpread > percentile")
+diAdxLen           = input.int(14, "DI/ADX Length", minval=1)
+
+diSpreadLen        = input.int(200, "DI Spread Lookback (percentile)", minval=50)
+diSpreadPct        = input.int(50,  "DI Spread Percentile (0-100)", minval=1, maxval=99)
+
+requireThrReady    = input.bool(false, "DI Gate: require percentile threshold ready",
+     tooltip="If ON, gate will block until diSpreadLen bars exist. If OFF, it will fall back safely so it won't brick early.")
+
+// ADX gate (two bullish regimes)
+useAdxGate         = input.bool(true, "ADX Gate: enable")
+adxMin             = input.float(15.0, "ADX Minimum", step=0.5, minval=0.0, maxval=100.0)
+adxUpBars          = input.int(2, "ADX rising bars (consistency)", minval=1, maxval=5,
+     tooltip="Consecutive rising bars required to qualify as 'ADX rising consistently' regime.")
+
+// RSI gate
+useRsiGate = input.bool(true, "Gate: RSI > threshold")
+rsiLen     = input.int(14, "RSI Length", minval=1)
+rsiThresh  = input.int(50, "RSI Threshold", minval=1, maxval=99)
+
+//──────────────────────────────────────────────────────────────────────────────
+// NORMALIZATION BASE
+//──────────────────────────────────────────────────────────────────────────────
+normLen = input.int(50, "Normalization Len", minval=10,
+     tooltip="Used to compute macdScale = EMA(|fastMACD|) and histScale = EMA(|histFast|).")
+
+// BUY buffers
+useBuyBuffer = input.bool(true, "Buy Buffer: require fastMACD above adaptive floor")
+buyBufferPct = input.float(0.2, "Buy Buffer % of macdScale", step=0.05, minval=0.00, maxval=5.00,
+     tooltip="fastMACD must be > (buyBufferPct * macdScale). macdScale=EMA(|fastMACD|).")
+
+useSigDivGate = input.bool(true, "Buy Gate: require MACD/SIG divergence (adaptive)")
+sigDivPct     = input.float(0.2, "MACD-SIG Divergence % of histScale", step=0.05, minval=0.00, maxval=5.00,
+     tooltip="Require (fastMACD-fastSIG) > (sigDivPct * histScale). histScale=EMA(|histFast|).")
+
+useMacdRising2 = input.bool(false, "Buy Gate: require 2-bar MACD rising (fastMACD[1] > fastMACD[2])")
+
+// Slow MACD proximity gate
+useSlowProxGate = input.bool(true, "Buy Gate: fastMACD not too far below slowMACD (adaptive)")
+slowGapPct      = input.float(0.50, "Allowed gap below slowMACD (% macdScale)", step=0.05, minval=0.00, maxval=5.00,
+     tooltip="Require fastMACD >= slowMACD - (slowGapPct * macdScale). Uses macdScale so it actually has bite.")
+
+// SELL buffer controls (hist-based; already normalized well)
+useSellBuffer = input.bool(true,  "Sell Buffer: require meaningful cross")
+bufferPct     = input.float(0.15, "Sell Buffer % (of avg |hist|)", step=0.01, minval=0.00, maxval=1.00)
+confirmBars   = input.int(1,      "Sell Confirm Bars below buffer", minval=1, maxval=10)
+
+useSellRatioGate = input.bool(false, "Sell Gate: fastMACD < slowMACD * ratio (guarded)")
+sellRatio        = input.float(0.81, "Sell Ratio vs SlowMACD", step=0.01, minval=0.05, maxval=2.0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// EMA + VWAP FILTERS
+//──────────────────────────────────────────────────────────────────────────────
+ema9   = ta.ema(close, 9)
+ema20  = ta.ema(close, 20)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+vwap1  = ta.vwap(hlc3)
+
+isBullStrict     = close > ema9 and ema9 >= ema20 and ema20 >= ema200
+isEmaSoftStack   = close > ema9 and ema9 > ema20
+isSofterStack    = close >= ema9 and close >= ema20
+vwapStrictOk     = close >= vwap1
+vwapSoftOkEarly  = vwapStrictOk or isEmaSoftStack
+
+useStructure = input.bool(true, "Structure Filter: HH + HL")
+isHigher = high > high[1] and low >= low[1]
+structureOk = not useStructure or isHigher
+
+bullMode = input.string("Softer", "Bull Filter Mode", options=["Off", "Soft", "Softer", "Strict"])
+bullOk =
+     bullMode == "Off"     ? true :
+     bullMode == "Soft"    ? vwapSoftOkEarly :
+     bullMode == "Softer"  ? isSofterStack :
+                             isBullStrict
+
+//──────────────────────────────────────────────────────────────────────────────
+// Formatting helpers (debug)
+//──────────────────────────────────────────────────────────────────────────────
+f_t2(_x) => na(_x) ? "na" : str.tostring(_x, "#.##")
+f_t3(_x) => na(_x) ? "na" : str.tostring(_x, "#.###")
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE CALCS
+//──────────────────────────────────────────────────────────────────────────────
+fastMACD = ta.ema(src, fastFastLen) - ta.ema(src, fastSlowLen)
+fastSIG  = ta.ema(fastMACD, fastSigLen)
+histFast = fastMACD - fastSIG
+
+slowMACD = ta.ema(src, slowFastLen) - ta.ema(src, slowSlowLen)
+slowSIG  = ta.ema(slowMACD, slowSigLen)
+
+// Scales (v5.4 key fix)
+macdScale = ta.ema(math.abs(fastMACD), normLen)
+histScale = ta.ema(math.abs(histFast), normLen)
+
+// Adaptive thresholds
+buyBufferAbs = buyBufferPct * macdScale
+sigDivAbs    = sigDivPct    * histScale
+slowGapAbs   = slowGapPct   * macdScale
+
+//──────────────────────────────────────────────────────────────────────────────
+// DI/ADX + RSI Gates
+//──────────────────────────────────────────────────────────────────────────────
+[diPlus, diMinus, adx] = ta.dmi(diAdxLen, 14)
+
+diSpread       = diPlus - diMinus
+diPM           = diPlus > diPlus[1] and diMinus < diMinus[1]
+diSpreadThrRaw = ta.percentile_linear_interpolation(diSpread, diSpreadLen, diSpreadPct)
+thrReady       = not na(diSpreadThrRaw)
+diSpreadThr    = thrReady ? diSpreadThrRaw : 0.0
+
+diTrendOk = diPlus > diMinus and diPM
+spreadOk  = diSpread > diSpreadThr
+
+// ADX regimes (same as v5.3)
+adxRisingOk = ta.rising(adx, adxUpBars)
+adxHoldOk   = adx >= diMinus
+adxOk = not useAdxGate ? true : (adx >= adxMin) and (adxRisingOk or adxHoldOk)
+
+// Combined DI/ADX
+diAdxOk = (not useDiTrendGate   or diTrendOk) and (not useSpreadPctGate or (spreadOk and (not requireThrReady or thrReady))) and (not useAdxGate       or adxOk)
+
+diAdxGateOk = not useDiAdxGate or diAdxOk
+
+// RSI gate
+rsiVal = ta.rsi(src, rsiLen)
+rsiOk  = rsiVal > rsiThresh
+rsiGateOk = not useRsiGate or rsiOk
+
+//──────────────────────────────────────────────────────────────────────────────
+// BUY LOGIC
+//──────────────────────────────────────────────────────────────────────────────
+macdVsSigOk  = useSigDivGate ? (fastMACD >= fastSIG + sigDivAbs) : (fastMACD >= fastSIG)
+macdRisingOk = useMacdRising2 ? (fastMACD >= fastMACD[1] and fastMACD[1] >= fastMACD[2]) : (fastMACD >= fastSIG)
+stage1       = macdVsSigOk or macdRisingOk
+
+buyEvent   = useBuyBuffer ? (fastMACD > buyBufferAbs) : (fastMACD > 0)
+slowProxOk = not useSlowProxGate or (fastMACD >= (slowMACD - slowGapAbs))
+
+confirmed = stage1 and bullOk and structureOk and diAdxGateOk and rsiGateOk and buyEvent and slowProxOk
+rawBuy    = confirmed and not confirmed[1]
+
+//──────────────────────────────────────────────────────────────────────────────
+// SELL LOGIC (hysteresis)
+//──────────────────────────────────────────────────────────────────────────────
+bufAbs = histScale * bufferPct
+
+sellCrossEvent = useSellBuffer ? ta.crossunder(histFast, -bufAbs) : ta.crossunder(histFast, 0)
+belowBuf      = useSellBuffer ? (histFast < -bufAbs) : (histFast < 0)
+belowBufN     = confirmBars <= 1 ? belowBuf : (math.sum(belowBuf ? 1 : 0, confirmBars) == confirmBars)
+
+ratioOk = not useSellRatioGate or (slowMACD > 0 and fastMACD < (slowMACD * sellRatio))
+rawSell = ratioOk and (sellCrossEvent or belowBufN)
+
+// Bar close option
+canFire = not triggerOnClose or barstate.isconfirmed
+rawBuy  := rawBuy  and canFire
+rawSell := rawSell and canFire
+
+//──────────────────────────────────────────────────────────────────────────────
+// POSITION STATE
+//──────────────────────────────────────────────────────────────────────────────
+var int pos = 0
+buy  = rawBuy
+sell = rawSell
+
+if oneSignalPerTrade
+    buy  := rawBuy  and pos == 0
+    sell := rawSell and pos == 1
+
+if buy
+    pos := 1
+else if sell
+    pos := 0
+
+//──────────────────────────────────────────────────────────────────────────────
+// CHART SIGNALS
+//──────────────────────────────────────────────────────────────────────────────
+plotshape(buy,  title="Confirmed BUY", style=shape.triangleup,   location=location.belowbar,
+     size=size.tiny, color=color.new(#51ff00, 0), text="= =", textcolor=color.rgb(255, 230, 0))
+
+plotshape(sell, title="SELL",          style=shape.triangledown, location=location.abovebar,
+     size=size.tiny, color=color.new(#f23645,  0), text="= =", textcolor=color.rgb(255, 230, 0))
+
+bgcolor(showBG and pos == 1 ? color.new(color.green, bgOpacity) : na)
+
+// Alerts
+alertcondition(buy,  title="HxB Confirmed BUY", message="HxB BUY: MACD normalized + DI/ADX gate + RSI gate + filters.")
+alertcondition(sell, title="HxB SELL",          message="HxB SELL: buffered MACD histogram breakdown (anti-tap).")
+
+//──────────────────────────────────────────────────────────────────────────────
+// DEBUG PANEL
+//──────────────────────────────────────────────────────────────────────────────
+showDebug = input.bool(false, "DEBUG: Show Gate Panel (last bar)")
+debugPos  = input.string("Top Right", "DEBUG: Panel Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"])
+
+f_pos(_s) => _s == "Top Right" ? position.top_right : _s == "Top Left" ? position.top_left : _s == "Bottom Right" ? position.bottom_right : position.bottom_left
+
+cOK  = color.new(color.lime, 0)
+cBAD = color.new(color.red, 0)
+cHDR = color.new(color.black, 0)
+cBG  = color.new(color.black, 70)
+
+f_status(_b) => _b ? "PASS" : "FAIL"
+f_col(_b)    => _b ? cOK : cBAD
+
+var table dbg = table.new(f_pos(debugPos), 3, 24, border_width=1)
+
+f_setRow(_r, _name, _pass, _val) =>
+    table.cell(dbg, 0, _r, _name, text_color=color.white, bgcolor=cBG)
+    table.cell(dbg, 1, _r, f_status(_pass), text_color=color.white, bgcolor=f_col(_pass))
+    table.cell(dbg, 2, _r, _val, text_color=color.white, bgcolor=cBG)
+
+if barstate.islast and showDebug
+    table.cell(dbg, 0, 0, "HxB MACDv5.4 DEBUG", text_color=color.white, bgcolor=cHDR)
+    table.cell(dbg, 1, 0, "STATE",             text_color=color.white, bgcolor=cHDR)
+    table.cell(dbg, 2, 0, "VALUE / THRESH",     text_color=color.white, bgcolor=cHDR)
+
+    f_setRow(1, "confirmed", confirmed, "")
+    f_setRow(2, "rawBuy / rawSell", (rawBuy or rawSell), "buy=" + str.tostring(rawBuy) + " sell=" + str.tostring(rawSell))
+    f_setRow(3, "pos (1=long)", (pos == 1), str.tostring(pos))
+    f_setRow(4, "canFire", canFire, triggerOnClose ? "TriggerOnClose=ON" : "TriggerOnClose=OFF")
+
+    // Scales (key!)
+    f_setRow(5, "macdScale", true, f_t3(macdScale))
+    f_setRow(6, "histScale", true, f_t3(histScale))
+
+    // Buy gates
+    f_setRow(7,  "stage1", stage1, "")
+    f_setRow(8,  "MACD>=SIG+div", macdVsSigOk, "diff=" + f_t3(histFast) + " thr=" + f_t3(sigDivAbs))
+    f_setRow(9,  "MACD rising", macdRisingOk, "m=" + f_t3(fastMACD) + " m1=" + f_t3(fastMACD[1]))
+    f_setRow(10, "BuyBuffer", buyEvent, "m=" + f_t3(fastMACD) + " thr=" + f_t3(buyBufferAbs))
+    f_setRow(11, "SlowProx", slowProxOk, "m=" + f_t3(fastMACD) + " >= " + f_t3(slowMACD - slowGapAbs))
+
+    // Filters
+    f_setRow(12, "bullOk", bullOk, "mode=" + bullMode)
+    f_setRow(13, "structureOk", structureOk, useStructure ? "ON" : "OFF")
+    f_setRow(14, "RSI Gate", rsiGateOk, "rsi=" + f_t2(rsiVal) + " thr=" + str.tostring(rsiThresh))
+
+    // DI/ADX breakdown
+    f_setRow(15, "DI/ADX Gate (master)", diAdxGateOk, useDiAdxGate ? "ON" : "OFF")
+    f_setRow(16, "DI trend (DI+>DI-)", (not useDiTrendGate or diTrendOk), "di+=" + f_t2(diPlus) + " di-=" + f_t2(diMinus))
+    f_setRow(17, "SpreadPct gate", (not useSpreadPctGate or (spreadOk and (not requireThrReady or thrReady))),
+        "spread=" + f_t2(diSpread) + " thr=" + f_t2(diSpreadThr) + " pct=" + str.tostring(diSpreadPct))
+    f_setRow(18, "thrReady", (not requireThrReady or thrReady), "ready=" + str.tostring(thrReady) + " len=" + str.tostring(diSpreadLen))
+
+    // ADX regimes
+    f_setRow(19, "ADX gate (master)", (not useAdxGate or adxOk), "adx=" + f_t2(adx) + " min=" + f_t2(adxMin) + " di-=" + f_t2(diMinus))
+    f_setRow(20, "ADX rising regime", adxRisingOk, "upBars=" + str.tostring(adxUpBars))
+    f_setRow(21, "ADX hold regime", adxHoldOk, "require adx>=di- when not rising")
+
+    // Sell snapshot
+    f_setRow(22, "SELL bufAbs", true, "hist=" + f_t3(histFast) + " buf=" + f_t3(bufAbs))
+    f_setRow(23, "Sell ratio gate", ratioOk, useSellRatioGate ? ("ratio=" + f_t2(sellRatio) + " slow=" + f_t3(slowMACD)) : "OFF")
+else if barstate.islast and not showDebug
+    for r = 0 to 23
+        for c = 0 to 2
+            table.cell(dbg, c, r, "", bgcolor=color.new(color.black, 100))
